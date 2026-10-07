@@ -1,0 +1,154 @@
+name: Windows 11 RDP via Tailscale
+
+on:
+  workflow_dispatch:
+    inputs:
+      custom_password:
+        description: "Senha do usuário RDP (opcional, deixa aleatória se vazio)"
+        required: false
+        default: ""
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 3600  # até 60 horas
+
+    steps:
+      # =========================
+      # 1. Configurar RDP
+      # =========================
+      - name: Configure Core RDP Settings
+        run: |
+          # Habilitar Remote Desktop
+          Set-ItemProperty -Path 'HKLM:SystemCurrentControlSetControlTerminal Server' `
+            -Name "fDenyTSConnections" -Value 0 -Force
+
+          # Desativar NLA (para facilitar conexão externa)
+          Set-ItemProperty -Path 'HKLM:SystemCurrentControlSetControlTerminal ServerWinStationsRDP-Tcp' `
+            -Name "UserAuthentication" -Value 0 -Force
+
+          # Ajustar camada de segurança
+          Set-ItemProperty -Path 'HKLM:SystemCurrentControlSetControlTerminal ServerWinStationsRDP-Tcp' `
+            -Name "SecurityLayer" -Value 0 -Force
+
+          # Remover regra antiga (se existir)
+          netsh advfirewall firewall delete rule name="RDP-Tailscale" 2>$null
+
+          # Permitir RDP na porta 3389 (apenas na rede Tailscale)
+          netsh advfirewall firewall add rule name="RDP-Tailscale" `
+            dir=in action=allow protocol=TCP localport=3389 remoteip=100.64.0.0/10
+
+          # Reiniciar serviço RDP
+          Restart-Service -Name TermService -Force
+
+      # =========================
+      # 2. Criar usuário RDP
+      # =========================
+      - name: Create RDP User with Secure Password
+        run: |
+          $customPass = "${{ github.event.inputs.custom_password }}"
+
+          if ($customPass -and $customPass.Length -ge 8) {
+            $password = $customPass
+          } else {
+            # Gerar senha forte aleatória
+            Add-Type -AssemblyName System.Security
+            $charSet = @{
+              Upper   = [char[]](65..90)
+              Lower   = [char[]](97..122)
+              Number  = [char[]](48..57)
+              Special = ([char[]](33..47) + [char[]](58..64) + [char[]](91..96) + [char[]](123..126))
+            }
+            $rawPassword = @()
+            $rawPassword += $charSet.Upper   | Get-Random -Count 4
+            $rawPassword += $charSet.Lower   | Get-Random -Count 4
+            $rawPassword += $charSet.Number  | Get-Random -Count 4
+            $rawPassword += $charSet.Special | Get-Random -Count 4
+            $password = -join ($rawPassword | Sort-Object { Get-Random })
+          }
+
+          $securePass = ConvertTo-SecureString $password -AsPlainText -Force
+
+          # Criar usuário "RDP"
+          $username = "RDP"
+          if (Get-LocalUser -Name $username -ErrorAction SilentlyContinue) {
+            Remove-LocalUser -Name $username
+          }
+          New-LocalUser -Name $username -Password $securePass -AccountNeverExpires
+          Add-LocalGroupMember -Group "Administrators" -Member $username
+          Add-LocalGroupMember -Group "Remote Desktop Users" -Member $username
+
+          # Salvar senha em variável de ambiente do job
+          echo "RDP_PASSWORD=$password" >> $env:GITHUB_ENV
+
+      # =========================
+      # 3. Instalar Tailscale
+      # =========================
+      - name: Install Tailscale
+        run: |
+          $tsUrl = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
+          $installerPath = "$env:TEMP\tailscale.msi"
+
+          Invoke-WebRequest -Uri $tsUrl -OutFile $installerPath
+          Start-Process msiexec.exe -ArgumentList "/i", "`"$installerPath`"", "/quiet", "/norestart" -Wait
+          Remove-Item $installerPath -Force
+
+      # =========================
+      # 4. Conectar à Tailscale
+      # =========================
+      - name: Establish Tailscale Connection
+        run: |
+          $tsExe = "$env:ProgramFilesTailscale\tailscale.exe"
+
+          # Conectar usando authkey dos secrets
+          & $tsExe up --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} --hostname=gh-win11-rdp-$env:GITHUB_RUN_ID
+
+          # Aguardar IP ser atribuído
+          $tsIP = $null
+          for ($i = 0; $i -lt 30; $i++) {
+            $info = & $tsExe ip -4
+            if ($info) {
+              $tsIP = $info.Trim()
+              break
+            }
+            Start-Sleep -Seconds 2
+          }
+
+          if (-not $tsIP) {
+            Write-Error "Falha ao obter IP da Tailscale"
+            exit 1
+          }
+
+          Write-Host "Tailscale IP: $tsIP"
+          echo "TAILSCALE_IP=$tsIP" >> $env:GITHUB_ENV
+
+          # Testar porta 3389
+          $testResult = Test-NetConnection -ComputerName $tsIP -Port 3389 -InformationLevel Quiet
+          if (-not $testResult) {
+            Write-Warning "Porta 3389 ainda não responde no IP da Tailscale (pode levar alguns segundos)"
+          }
+
+      # =========================
+      # 5. Mostrar dados de conexão
+      # =========================
+      - name: Show Connection Info
+        run: |
+          Write-Host "========================================"
+          Write-Host "Windows 11 VM com RDP via Tailscale"
+          Write-Host "IP Tailscale: ${{ env.TAILSCALE_IP }}"
+          Write-Host "Usuário: RDP"
+          Write-Host "Senha: ${{ env:RDP_PASSWORD }}"
+          Write-Host "========================================"
+          Write-Host "No seu PC:"
+          Write-Host "  1. Instale a Tailscale e faça login na mesma rede."
+          Write-Host "  2. Abra 'Conexão de Área de Trabalho Remota' (mstsc)."
+          Write-Host "  3. Em 'Computador', digite: ${{ env.TAILSCALE_IP }}"
+          Write-Host "  4. Usuário: RDP"
+          Write-Host "  5. Senha: (veja acima)"
+          Write-Host "========================================"
+
+          # Manter o job rodando para a VM ficar acessível
+          Write-Host "Mantendo job ativo para RDP. Interrompa manualmente quando terminar."
+          while ($true) {
+            Start-Sleep -Seconds 300
+          }
